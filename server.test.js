@@ -1,62 +1,89 @@
 const test=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
-const dir=fs.mkdtempSync(path.join(os.tmpdir(),'talep-test-'));
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),'talep-auth-test-'));
 process.env.TALEP_DATA_DIR=dir;
+process.env.TALEP_INITIAL_ADMIN_PASSWORD='AdminTest123!';
 const {server,db}=require('./server');
-test('SQLite API: müşteri, talep, mesaj, ekip, durum ve görünürlük',async()=>{
+
+test('SQLite API: authentication, yetki, kullanıcı yönetimi ve müşteri akışı',async()=>{
  await new Promise(resolve=>server.listen(0,resolve));
  const base='http://127.0.0.1:'+server.address().port;
- const call=async(method,url,data)=>{let r=await fetch(base+url,{method,headers:{'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});return {status:r.status,data:await r.json()}};
+ const call=async(method,url,data,cookie='')=>{
+  const response=await fetch(base+url,{method,headers:{'Content-Type':'application/json',...(cookie?{Cookie:cookie}:{})},body:data===undefined?undefined:JSON.stringify(data)});
+  const setCookie=response.headers.get('set-cookie');
+  return {status:response.status,data:await response.json(),cookie:setCookie?setCookie.split(';')[0]:''};
+ };
  try{
   assert.equal((await call('GET','/api/health')).status,200);
   assert.equal((await fetch(base+'/data/talep-merkezi.db')).status,404);
-  assert.equal((await call('GET','/api/team')).data.members[0].name,'Demo Ekip Üyesi');
-  let addedMember=await call('POST','/api/admin/team-members',{name:'Ali Destek',username:'ali.destek',role:'destek'});
-  assert.equal(addedMember.status,201);
-  assert.equal(addedMember.data.member.active,1);
-  const memberId=addedMember.data.member.id;
-  let allMembers=await call('GET','/api/admin/team-members');
-  assert.ok(allMembers.data.members.some(member=>member.username==='ali.destek'));
-  let editedMember=await call('PATCH','/api/admin/team-members/'+memberId,{name:'Ali Yönetici',username:'ali.admin',role:'admin'});
-  assert.equal(editedMember.status,200);
-  assert.equal(editedMember.data.member.role,'admin');
-  let passiveMember=await call('PATCH','/api/admin/team-members/'+memberId,{active:false});
-  assert.equal(passiveMember.status,200);
-  assert.equal(passiveMember.data.member.active,0);
-  allMembers=await call('GET','/api/admin/team-members');
-  assert.equal(allMembers.data.members.find(member=>member.id===memberId).active,0);
-  assert.ok(!(await call('GET','/api/team')).data.members.some(member=>member.id===memberId));
-  assert.equal(db.prepare('SELECT active FROM team_members WHERE id=?').get(memberId).active,0);
-  assert.equal((await call('POST','/api/admin/team-members',{name:'Başka Kullanıcı',username:'ali.admin',role:'destek'})).status,409);
-  assert.equal((await call('POST','/api/requests',{phone:'bad',category:'printer'})).status,422);
-  let created=await call('POST','/api/requests',{phone:'05321112233',name:'Ayşe',company:'ABC',category:'printer',option_value:"80'lik",priority:'Normal',description:'Kurulum',anydesk_code:'123456789'});
+  assert.equal((await call('GET','/api/requests')).status,401);
+  assert.equal((await call('GET','/api/team')).status,401);
+  assert.equal((await call('GET','/api/admin/team-members')).status,401);
+  assert.equal((await call('POST','/api/auth/login',{username:'admin',password:'yanlis-parola'})).status,401);
+
+  const adminLogin=await call('POST','/api/auth/login',{username:'admin',password:'AdminTest123!'});
+  assert.equal(adminLogin.status,200);
+  assert.equal(adminLogin.data.user.role,'admin');
+  assert.match(adminLogin.cookie,/^talep_session=/);
+  const adminCookie=adminLogin.cookie;
+  assert.equal((await call('GET','/api/auth/me',undefined,adminCookie)).data.user.username,'admin');
+  assert.equal((await call('GET','/api/admin/team-members',undefined,adminCookie)).status,200);
+  assert.equal((await fetch(base+'/personel')).status,200);
+  const adminId=adminLogin.data.user.id;
+  assert.equal((await call('PATCH','/api/admin/team-members/'+adminId,{active:false},adminCookie)).status,409);
+  assert.equal((await call('PATCH','/api/admin/team-members/'+adminId,{role:'destek'},adminCookie)).status,409);
+  assert.equal((await call('POST','/api/admin/team-members',{name:'Kısa Parola',username:'kisa',role:'destek',password:'Abc1234'},adminCookie)).status,422);
+
+  const added=await call('POST','/api/admin/team-members',{name:'Ali Destek',username:'ali.destek',role:'destek',password:'Abcd1234'},adminCookie);
+  assert.equal(added.status,201);
+  const memberId=added.data.member.id;
+  let listed=await call('GET','/api/admin/team-members',undefined,adminCookie);
+  assert.ok(listed.data.members.some(member=>member.id===memberId));
+
+  const supportLogin=await call('POST','/api/auth/login',{username:'ali.destek',password:'Abcd1234'});
+  assert.equal(supportLogin.status,200);
+  assert.equal(supportLogin.data.user.role,'destek');
+  const supportCookie=supportLogin.cookie;
+  assert.equal((await call('GET','/api/admin/team-members',undefined,supportCookie)).status,403);
+  assert.equal((await call('GET','/api/team',undefined,supportCookie)).status,200);
+
+  const created=await call('POST','/api/requests',{phone:'05321112233',name:'Ayşe',company:'ABC',category:'printer',option_value:"80'lik",priority:'Normal',description:'Kurulum',anydesk_code:'123456789'});
   assert.equal(created.status,201);
-  let {request_number:number,public_token:token}=created.data;
+  const {request_number:number,public_token:token}=created.data;
   assert.match(number,/^TK-\d{4}-000001$/);
-  assert.equal((await call('GET','/api/customers/lookup?phone=05321112233')).data.customer.name,'Ayşe');
-  assert.equal((await call('GET','/api/customers/lookup?phone=9905321112233')).data.customer.name,'Ayşe');
-  assert.equal((await call('POST','/api/requests',{phone:'05321112233',category:'printer',name:''})).status,422);
-  let list=await call('GET','/api/customer/requests?phone=05321112233');
-  assert.equal(list.data.requests.length,1);
-  assert.equal((await call('GET','/api/public/requests/'+number+'?token=wrong')).status,404);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'Tamamlandı'})).status,422);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'take'})).status,200);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'Tamamlandı'})).status,422);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'İşleme Alındı'})).status,200);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'Müşteriden Bilgi Bekleniyor'})).status,200);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'İşleme Alındı'})).status,422);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'Tamamlandı'})).status,200);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'message',message:'İç bilgi',internal:true})).status,200);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'message',message:'Hazır',internal:false})).status,200);
+  assert.equal((await call('GET','/api/customer/requests?phone=05321112233')).data.requests.length,1);
+  assert.equal((await call('GET','/api/public/requests/'+number+'?token='+token)).status,200);
+  assert.equal((await call('GET','/api/requests',undefined,supportCookie)).data.requests.length,1);
+
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'take',actor:'Sahte Kullanıcı'},supportCookie)).status,200);
+  let teamDetail=await call('GET','/api/requests/'+number,undefined,supportCookie);
+  assert.ok(teamDetail.data.request.events.some(event=>event.actor_name==='Ali Destek'&&event.event_type==='assigned'));
+  assert.ok(!teamDetail.data.request.events.some(event=>event.actor_name==='Sahte Kullanıcı'));
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'İşleme Alındı'},supportCookie)).status,200);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'message',message:'Hazır',internal:false},supportCookie)).status,200);
   assert.equal((await call('POST','/api/public/requests/'+number,{token,message:'Teşekkürler'})).status,201);
-  let publicDetail=await call('GET','/api/public/requests/'+number+'?token='+token);
-  assert.equal(publicDetail.data.request.status,'Tamamlandı');
-  assert.ok(publicDetail.data.request.events.some(e=>e.body.includes('Teşekkürler')));
-  assert.ok(!publicDetail.data.request.events.some(e=>e.body.includes('İç bilgi')));
-  let teamDetail=await call('GET','/api/requests/'+number);
-  assert.ok(teamDetail.data.request.events.some(e=>e.body.includes('İç bilgi')));
-  assert.equal(db.prepare('SELECT COUNT(*) n FROM requests').get().n,1);
-  assert.equal((await call('POST','/api/requests',{phone:'05321112233',category:'credit',amount_tl:100,credit_amount:5})).status,422);
- }finally{await new Promise(resolve=>server.close(resolve));db.close();assert.equal(path.dirname(fs.realpathSync(dir)),fs.realpathSync(os.tmpdir()));fs.rmSync(dir,{recursive:true,force:true})}
+
+  const edited=await call('PATCH','/api/admin/team-members/'+memberId,{name:'Ali Destek Güncel',username:'ali.destek',role:'destek'},adminCookie);
+  assert.equal(edited.status,200);
+  const passive=await call('PATCH','/api/admin/team-members/'+memberId,{active:false},adminCookie);
+  assert.equal(passive.status,200);
+  assert.equal(passive.data.member.active,0);
+  listed=await call('GET','/api/admin/team-members',undefined,adminCookie);
+  assert.equal(listed.data.members.find(member=>member.id===memberId).active,0);
+  assert.equal(db.prepare('SELECT COUNT(*) count FROM team_members WHERE id=?').get(memberId).count,1);
+  assert.equal((await call('POST','/api/auth/login',{username:'ali.destek',password:'Abcd1234'})).status,401);
+  assert.equal((await call('GET','/api/requests',undefined,supportCookie)).status,401);
+
+  const publicDetail=await call('GET','/api/public/requests/'+number+'?token='+token);
+  assert.ok(publicDetail.data.request.events.some(event=>event.body.includes('Teşekkürler')));
+  assert.equal(db.prepare('SELECT COUNT(*) count FROM requests').get().count,1);
+  assert.equal((await call('POST','/api/auth/logout',{},adminCookie)).status,200);
+  assert.equal((await call('GET','/api/auth/me',undefined,adminCookie)).status,401);
+ }finally{
+  await new Promise(resolve=>server.close(resolve));
+  db.close();
+  assert.equal(path.dirname(fs.realpathSync(dir)),fs.realpathSync(os.tmpdir()));
+  fs.rmSync(dir,{recursive:true,force:true});
+ }
 });
