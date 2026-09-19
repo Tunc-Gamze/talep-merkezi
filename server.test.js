@@ -48,20 +48,46 @@ test('SQLite API: authentication, yetki, kullanıcı yönetimi ve müşteri akı
   assert.equal((await call('GET','/api/admin/team-members',undefined,supportCookie)).status,403);
   assert.equal((await call('GET','/api/team',undefined,supportCookie)).status,200);
 
+  const second=await call('POST','/api/admin/team-members',{name:'Gamze Destek',username:'gamze.destek',role:'destek',password:'Abcd5678'},adminCookie);
+  assert.equal(second.status,201);
+  const secondId=second.data.member.id;
+  const secondLogin=await call('POST','/api/auth/login',{username:'gamze.destek',password:'Abcd5678'});
+  assert.equal(secondLogin.status,200);
+  const secondCookie=secondLogin.cookie;
+
   const created=await call('POST','/api/requests',{phone:'05321112233',name:'Ayşe',company:'ABC',category:'printer',option_value:"80'lik",priority:'Normal',description:'Kurulum',anydesk_code:'123456789'});
   assert.equal(created.status,201);
   const {request_number:number,public_token:token}=created.data;
   assert.match(number,/^TK-\d{4}-000001$/);
   assert.equal((await call('GET','/api/customer/requests?phone=05321112233')).data.requests.length,1);
   assert.equal((await call('GET','/api/public/requests/'+number+'?token='+token)).status,200);
-  assert.equal((await call('GET','/api/requests',undefined,supportCookie)).data.requests.length,1);
+  const teamList=(await call('GET','/api/requests',undefined,supportCookie)).data.requests;
+  assert.equal(teamList.length,1);
+  assert.equal(teamList[0].description,undefined);
+  assert.equal(teamList[0].public_token,undefined);
+  assert.equal((await call('GET','/api/requests/'+number+'/revision')).status,401);
+  const initialRevision=(await call('GET','/api/requests/'+number+'/revision',undefined,supportCookie)).data.revision;
 
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'take',actor:'Sahte Kullanıcı'},supportCookie)).status,200);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'take',actor:'Sahte Kullanıcı',assigned_user_id:adminId},supportCookie)).status,200);
+  assert.notEqual((await call('GET','/api/requests/'+number+'/revision',undefined,secondCookie)).data.revision,initialRevision);
   let teamDetail=await call('GET','/api/requests/'+number,undefined,supportCookie);
+  assert.equal(teamDetail.data.request.assigned_user_id,memberId);
+  assert.equal(teamDetail.data.request.assigned_to,'Ali Destek');
   assert.ok(teamDetail.data.request.events.some(event=>event.actor_name==='Ali Destek'&&event.event_type==='assigned'));
+  assert.ok(teamDetail.data.request.events.some(event=>event.actor_user_id===memberId&&event.event_type==='assigned'));
   assert.ok(!teamDetail.data.request.events.some(event=>event.actor_name==='Sahte Kullanıcı'));
   assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'İşleme Alındı'},supportCookie)).status,200);
-  assert.equal((await call('PATCH','/api/requests/'+number,{action:'message',message:'Hazır',internal:false},supportCookie)).status,200);
+  const beforeRemoteMessage=(await call('GET','/api/requests/'+number+'/revision',undefined,supportCookie)).data.revision;
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'message',message:'Hazır',internal:false,actor:'Ali Destek'},secondCookie)).status,200);
+  assert.notEqual((await call('GET','/api/requests/'+number+'/revision',undefined,supportCookie)).data.revision,beforeRemoteMessage);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'message',message:'İç not',internal:true,actor_user_id:memberId},secondCookie)).status,200);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'Müşteriden Bilgi Bekleniyor'},secondCookie)).status,200);
+  teamDetail=await call('GET','/api/requests/'+number,undefined,secondCookie);
+  assert.equal(teamDetail.data.request.assigned_user_id,memberId);
+  assert.equal(teamDetail.data.request.assigned_to,'Ali Destek');
+  assert.ok(teamDetail.data.request.events.some(event=>event.actor_user_id===secondId&&event.actor_name==='Gamze Destek'&&event.event_type==='message'));
+  assert.ok(teamDetail.data.request.events.some(event=>event.actor_user_id===secondId&&event.actor_name==='Gamze Destek'&&event.event_type==='note'));
+  assert.ok(teamDetail.data.request.events.some(event=>event.actor_user_id===secondId&&event.actor_name==='Gamze Destek'&&event.event_type==='status'));
   assert.equal((await call('POST','/api/public/requests/'+number,{token,message:'Teşekkürler'})).status,201);
 
   const edited=await call('PATCH','/api/admin/team-members/'+memberId,{name:'Ali Destek Güncel',username:'ali.destek',role:'destek'},adminCookie);
@@ -72,6 +98,10 @@ test('SQLite API: authentication, yetki, kullanıcı yönetimi ve müşteri akı
   listed=await call('GET','/api/admin/team-members',undefined,adminCookie);
   assert.equal(listed.data.members.find(member=>member.id===memberId).active,0);
   assert.equal(db.prepare('SELECT COUNT(*) count FROM team_members WHERE id=?').get(memberId).count,1);
+  teamDetail=await call('GET','/api/requests/'+number,undefined,secondCookie);
+  assert.equal(teamDetail.data.request.assigned_user_id,memberId);
+  assert.equal(teamDetail.data.request.assigned_to,'Ali Destek Güncel');
+  assert.ok(teamDetail.data.request.events.some(event=>event.actor_user_id===memberId&&event.actor_name==='Ali Destek'&&event.event_type==='assigned'));
   assert.equal((await call('POST','/api/auth/login',{username:'ali.destek',password:'Abcd1234'})).status,401);
   assert.equal((await call('GET','/api/requests',undefined,supportCookie)).status,401);
 
