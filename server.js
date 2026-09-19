@@ -9,7 +9,14 @@ CREATE TABLE IF NOT EXISTS request_events(id INTEGER PRIMARY KEY,request_id INTE
 CREATE TABLE IF NOT EXISTS team_members(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)));
 CREATE INDEX IF NOT EXISTS requests_customer_idx ON requests(customer_id,created_at DESC);
 CREATE INDEX IF NOT EXISTS events_request_idx ON request_events(request_id,id);`);
-db.prepare('INSERT OR IGNORE INTO team_members(name) VALUES(?)').run('Demo Ekip Üyesi');
+const teamColumns=new Set(db.prepare('PRAGMA table_info(team_members)').all().map(column=>column.name));
+if(!teamColumns.has('username'))db.exec("ALTER TABLE team_members ADD COLUMN username TEXT NOT NULL DEFAULT ''");
+if(!teamColumns.has('role'))db.exec("ALTER TABLE team_members ADD COLUMN role TEXT NOT NULL DEFAULT 'destek'");
+if(!teamColumns.has('created_at'))db.exec("ALTER TABLE team_members ADD COLUMN created_at TEXT NOT NULL DEFAULT ''");
+db.prepare("UPDATE team_members SET username='demo',role='admin',created_at=COALESCE(NULLIF(created_at,''),CURRENT_TIMESTAMP) WHERE name='Demo Ekip Üyesi'").run();
+for(const member of db.prepare("SELECT id FROM team_members WHERE username='' OR created_at='' ").all())db.prepare("UPDATE team_members SET username=CASE WHEN username='' THEN ? ELSE username END,created_at=CASE WHEN created_at='' THEN CURRENT_TIMESTAMP ELSE created_at END WHERE id=?").run('legacy-'+member.id,member.id);
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS team_members_username_idx ON team_members(username) WHERE username<>''");
+db.prepare("INSERT OR IGNORE INTO team_members(name,username,role,created_at) VALUES(?,?,?,CURRENT_TIMESTAMP)").run('Demo Ekip Üyesi','demo','admin');
 const transitions={'Yeni Talep':['Teslim Alındı'],'Teslim Alındı':['İşleme Alındı'],'İşleme Alındı':['Müşteriden Bilgi Bekleniyor','Tamamlandı'],'Müşteriden Bilgi Bekleniyor':['Tamamlandı','İptal Edildi'],'Tamamlandı':[],'İptal Edildi':[]};
 const categories=['integration','printer','credit','caller','feature','other'];
 const types={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json','.svg':'image/svg+xml'};
@@ -24,10 +31,35 @@ const detailed=(row,customerOnly=false)=>({...row,events:eventsFor(row.id,custom
 const getRequest=number=>db.prepare(requestSql+' WHERE r.request_number=?').get(number);
 const transaction=fn=>{db.exec('BEGIN IMMEDIATE');try{let result=fn();db.exec('COMMIT');return result}catch(error){db.exec('ROLLBACK');throw error}};
 function readBody(req){return new Promise((resolve,reject)=>{let chunks=[],size=0;req.on('data',chunk=>{size+=chunk.length;if(size>1e6){reject(Object.assign(Error('Veri çok büyük'),{status:413}));req.destroy();return}chunks.push(chunk)});req.on('end',()=>{try{resolve(JSON.parse(Buffer.concat(chunks).toString()||'{}'))}catch{reject(Object.assign(Error('Geçersiz JSON'),{status:400}))}});req.on('error',reject)})}
+const teamMemberSql='SELECT id,name,username,role,active,created_at FROM team_members';
+function teamMemberInput(body){
+ const name=clean(body.name,80),username=clean(body.username,50).toLocaleLowerCase('tr-TR'),role=clean(body.role,20);
+ if(name.length<2)return {error:'Ad en az 2 karakter olmalı.'};
+ if(!/^[a-z0-9._-]{3,50}$/.test(username))return {error:'Kullanıcı adı 3-50 karakter olmalı; yalnızca küçük harf, rakam, nokta, tire ve alt çizgi kullanılabilir.'};
+ if(!['admin','destek'].includes(role))return {error:'Rol admin veya destek olmalı.'};
+ return {name,username,role};
+}
 async function api(req,res,url){
  const method=req.method,route=url.pathname;
  if(method==='GET'&&route==='/api/health')return send(res,200,{ok:true,database:'sqlite'});
- if(method==='GET'&&route==='/api/team')return send(res,200,{members:db.prepare('SELECT id,name FROM team_members WHERE active=1 ORDER BY name').all()});
+ if(method==='GET'&&route==='/api/team')return send(res,200,{members:db.prepare(teamMemberSql+' WHERE active=1 ORDER BY name').all()});
+ if(route==='/api/admin/team-members'){
+  if(method==='GET')return send(res,200,{members:db.prepare(teamMemberSql+' ORDER BY active DESC,name').all()});
+  if(method==='POST'){
+   const input=teamMemberInput(await readBody(req));if(input.error)return send(res,422,{error:input.error});
+   try{const result=db.prepare('INSERT INTO team_members(name,username,role,active,created_at) VALUES(?,?,?,1,CURRENT_TIMESTAMP)').run(input.name,input.username,input.role);return send(res,201,{member:db.prepare(teamMemberSql+' WHERE id=?').get(result.lastInsertRowid)})}
+   catch(error){if(String(error.message).includes('UNIQUE'))return send(res,409,{error:'Bu ad veya kullanıcı adı zaten kullanılıyor.'});throw error}
+  }
+ }
+ const adminMemberMatch=route.match(/^\/api\/admin\/team-members\/(\d+)$/);
+ if(adminMemberMatch&&method==='PATCH'){
+  const id=Number(adminMemberMatch[1]),current=db.prepare(teamMemberSql+' WHERE id=?').get(id);if(!current)return send(res,404,{error:'Ekip üyesi bulunamadı.'});
+  const bodyData=await readBody(req),input=teamMemberInput({...current,...bodyData});if(input.error)return send(res,422,{error:input.error});
+  const active=bodyData.active===undefined?current.active:bodyData.active===true||bodyData.active===1?1:bodyData.active===false||bodyData.active===0?0:null;
+  if(active===null)return send(res,422,{error:'Aktiflik değeri geçersiz.'});
+  try{db.prepare('UPDATE team_members SET name=?,username=?,role=?,active=? WHERE id=?').run(input.name,input.username,input.role,active,id);return send(res,200,{member:db.prepare(teamMemberSql+' WHERE id=?').get(id)})}
+  catch(error){if(String(error.message).includes('UNIQUE'))return send(res,409,{error:'Bu ad veya kullanıcı adı zaten kullanılıyor.'});throw error}
+ }
  if(method==='GET'&&route==='/api/customers/lookup'){let p=phone(url.searchParams.get('phone'));return send(res,200,{customer:validPhone(p)?db.prepare('SELECT phone,name,company FROM customers WHERE phone=?').get(p)||null:null})}
  if(method==='GET'&&route==='/api/customer/requests'){let p=phone(url.searchParams.get('phone'));if(!validPhone(p))return send(res,422,{error:'Geçersiz telefon numarası.'});return send(res,200,{requests:db.prepare(requestSql+' WHERE c.phone=? ORDER BY r.id DESC').all(p)})}
  if(method==='GET'&&route==='/api/requests')return send(res,200,{requests:db.prepare(requestSql+' ORDER BY r.id DESC').all()});
@@ -88,3 +120,4 @@ const server=http.createServer(async(req,res)=>{try{
 }catch(error){console.error(error);if(!res.headersSent)send(res,error.status||500,{error:error.status?error.message:'Sunucu hatası.'})}});
 if(require.main===module)server.listen(process.env.PORT||3000,()=>console.log('Talep Merkezi: http://localhost:'+(process.env.PORT||3000)));
 module.exports={server,db};
+
