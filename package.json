@@ -1,0 +1,6 @@
+{
+  "name": "talep-merkezi-pwa",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": { "dev": "node server.js", "start": "node server.js", "test": "node server.test.js" }
+}

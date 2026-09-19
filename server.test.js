@@ -1,0 +1,45 @@
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),'talep-test-'));
+process.env.TALEP_DATA_DIR=dir;
+const {server,db}=require('./server');
+test('SQLite API: müşteri, talep, mesaj, ekip, durum ve görünürlük',async()=>{
+ await new Promise(resolve=>server.listen(0,resolve));
+ const base='http://127.0.0.1:'+server.address().port;
+ const call=async(method,url,data)=>{let r=await fetch(base+url,{method,headers:{'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});return {status:r.status,data:await r.json()}};
+ try{
+  assert.equal((await call('GET','/api/health')).status,200);
+  assert.equal((await fetch(base+'/data/talep-merkezi.db')).status,404);
+  assert.equal((await call('GET','/api/team')).data.members[0].name,'Demo Ekip Üyesi');
+  assert.equal((await call('POST','/api/requests',{phone:'bad',category:'printer'})).status,422);
+  let created=await call('POST','/api/requests',{phone:'05321112233',name:'Ayşe',company:'ABC',category:'printer',option_value:"80'lik",priority:'Normal',description:'Kurulum',anydesk_code:'123456789'});
+  assert.equal(created.status,201);
+  let {request_number:number,public_token:token}=created.data;
+  assert.match(number,/^TK-\d{4}-000001$/);
+  assert.equal((await call('GET','/api/customers/lookup?phone=05321112233')).data.customer.name,'Ayşe');
+  assert.equal((await call('GET','/api/customers/lookup?phone=9905321112233')).data.customer.name,'Ayşe');
+  assert.equal((await call('POST','/api/requests',{phone:'05321112233',category:'printer',name:''})).status,422);
+  let list=await call('GET','/api/customer/requests?phone=05321112233');
+  assert.equal(list.data.requests.length,1);
+  assert.equal((await call('GET','/api/public/requests/'+number+'?token=wrong')).status,404);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'Tamamlandı'})).status,422);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'take'})).status,200);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'Tamamlandı'})).status,422);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'İşleme Alındı'})).status,200);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'Müşteriden Bilgi Bekleniyor'})).status,200);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'İşleme Alındı'})).status,422);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'status',status:'Tamamlandı'})).status,200);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'message',message:'İç bilgi',internal:true})).status,200);
+  assert.equal((await call('PATCH','/api/requests/'+number,{action:'message',message:'Hazır',internal:false})).status,200);
+  assert.equal((await call('POST','/api/public/requests/'+number,{token,message:'Teşekkürler'})).status,201);
+  let publicDetail=await call('GET','/api/public/requests/'+number+'?token='+token);
+  assert.equal(publicDetail.data.request.status,'Tamamlandı');
+  assert.ok(publicDetail.data.request.events.some(e=>e.body.includes('Teşekkürler')));
+  assert.ok(!publicDetail.data.request.events.some(e=>e.body.includes('İç bilgi')));
+  let teamDetail=await call('GET','/api/requests/'+number);
+  assert.ok(teamDetail.data.request.events.some(e=>e.body.includes('İç bilgi')));
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM requests').get().n,1);
+  assert.equal((await call('POST','/api/requests',{phone:'05321112233',category:'credit',amount_tl:100,credit_amount:5})).status,422);
+ }finally{await new Promise(resolve=>server.close(resolve));db.close();assert.equal(path.dirname(fs.realpathSync(dir)),fs.realpathSync(os.tmpdir()));fs.rmSync(dir,{recursive:true,force:true})}
+});
