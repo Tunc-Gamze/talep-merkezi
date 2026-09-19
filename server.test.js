@@ -4,9 +4,25 @@ const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'talep-auth-test-'));
 process.env.TALEP_DATA_DIR=dir;
 process.env.TALEP_INITIAL_ADMIN_PASSWORD='AdminTest123!';
-const {server,db}=require('./server');
+const {server,db,businessStatusAt,setNowProviderForTests}=require('./server');
+
+test('Türkiye çalışma saati sınırları',()=>{
+ const open=value=>businessStatusAt(new Date(value)).is_open;
+ assert.equal(open('2026-09-21T05:59:00Z'),false);
+ assert.equal(open('2026-09-21T06:00:00Z'),true);
+ assert.equal(open('2026-09-21T14:59:00Z'),true);
+ assert.equal(open('2026-09-21T15:00:00Z'),false);
+ assert.equal(open('2026-09-26T05:59:00Z'),false);
+ assert.equal(open('2026-09-26T06:00:00Z'),true);
+ assert.equal(open('2026-09-26T09:59:00Z'),true);
+ assert.equal(open('2026-09-26T10:00:00Z'),false);
+ assert.equal(open('2026-09-27T00:00:00Z'),false);
+ assert.equal(open('2026-09-27T12:00:00Z'),false);
+ assert.equal(open('2026-09-27T20:59:00Z'),false);
+});
 
 test('SQLite API: authentication, yetki, kullanıcı yönetimi ve müşteri akışı',async()=>{
+ setNowProviderForTests(()=>new Date('2026-09-21T07:00:00Z'));
  await new Promise(resolve=>server.listen(0,resolve));
  const base='http://127.0.0.1:'+server.address().port;
  const call=async(method,url,data,cookie='')=>{
@@ -16,6 +32,7 @@ test('SQLite API: authentication, yetki, kullanıcı yönetimi ve müşteri akı
  };
  try{
   assert.equal((await call('GET','/api/health')).status,200);
+  assert.equal((await call('GET','/api/business-hours')).data.is_open,true);
   assert.equal((await fetch(base+'/data/talep-merkezi.db')).status,404);
   assert.equal((await call('GET','/api/requests')).status,401);
   assert.equal((await call('GET','/api/team')).status,401);
@@ -107,7 +124,19 @@ test('SQLite API: authentication, yetki, kullanıcı yönetimi ve müşteri akı
 
   const publicDetail=await call('GET','/api/public/requests/'+number+'?token='+token);
   assert.ok(publicDetail.data.request.events.some(event=>event.body.includes('Teşekkürler')));
-  assert.equal(db.prepare('SELECT COUNT(*) count FROM requests').get().count,1);
+
+  assert.equal((await call('POST','/api/requests',{phone:'05321112234',name:'Mesai İçi',category:'emergency',description:'Kesinti',is_emergency:true})).status,422);
+  setNowProviderForTests(()=>new Date('2026-09-21T17:00:00Z'));
+  assert.equal((await call('GET','/api/business-hours')).data.is_open,false);
+  assert.equal((await call('POST','/api/requests',{phone:'05321112235',name:'Mesai Dışı Normal',category:'other',priority:'Normal',description:'Normal talep'})).status,201);
+  const emergency=await call('POST','/api/requests',{phone:'05321112236',name:'Mesai Dışı Acil',category:'emergency',description:'Sisteme girilemiyor',is_emergency:true});
+  assert.equal(emergency.status,201);
+  const emergencyRow=db.prepare('SELECT category,priority,is_emergency FROM requests WHERE request_number=?').get(emergency.data.request_number);
+  assert.deepEqual({...emergencyRow},{category:'emergency',priority:'Acil',is_emergency:1});
+  const emergencyInTeam=(await call('GET','/api/requests',undefined,secondCookie)).data.requests.find(request=>request.request_number===emergency.data.request_number);
+  assert.equal(emergencyInTeam.is_emergency,1);
+  assert.equal(emergencyInTeam.category,'emergency');
+  assert.equal(db.prepare('SELECT COUNT(*) count FROM requests').get().count,3);
   assert.equal((await call('POST','/api/auth/logout',{},adminCookie)).status,200);
   assert.equal((await call('GET','/api/auth/me',undefined,adminCookie)).status,401);
  }finally{

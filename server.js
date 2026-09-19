@@ -21,6 +21,7 @@ for(const member of db.prepare("SELECT id FROM team_members WHERE username='' OR
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS team_members_username_idx ON team_members(username) WHERE username<>''");
 const requestColumns=new Set(db.prepare('PRAGMA table_info(requests)').all().map(column=>column.name));
 if(!requestColumns.has('assigned_user_id'))db.exec('ALTER TABLE requests ADD COLUMN assigned_user_id INTEGER REFERENCES team_members(id)');
+if(!requestColumns.has('is_emergency'))db.exec('ALTER TABLE requests ADD COLUMN is_emergency INTEGER NOT NULL DEFAULT 0 CHECK(is_emergency IN (0,1))');
 const eventColumns=new Set(db.prepare('PRAGMA table_info(request_events)').all().map(column=>column.name));
 if(!eventColumns.has('actor_user_id'))db.exec('ALTER TABLE request_events ADD COLUMN actor_user_id INTEGER REFERENCES team_members(id)');
 const customerIndexSql=db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='requests_customer_idx'").get()?.sql||'';
@@ -39,7 +40,15 @@ if(bootstrapAdmin){
  console.log(`Geçici admin girişi: ${bootstrapAdmin.username} / ${initialPassword}`);
 }
 const transitions={'Yeni Talep':['Teslim Alındı'],'Teslim Alındı':['İşleme Alındı'],'İşleme Alındı':['Müşteriden Bilgi Bekleniyor','Tamamlandı'],'Müşteriden Bilgi Bekleniyor':['Tamamlandı','İptal Edildi'],'Tamamlandı':[],'İptal Edildi':[]};
-const categories=['integration','printer','credit','caller','feature','other'];
+const categories=['integration','printer','credit','caller','feature','other','emergency'];
+const BUSINESS_HOURS={timezone:'Europe/Istanbul',schedule_label:'Hafta içi 09.00–18.00 · Cumartesi 09.00–13.00'};
+let nowProvider=()=>new Date();
+function businessStatusAt(date=nowProvider()){
+ const parts=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:BUSINESS_HOURS.timezone,weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(date).filter(part=>part.type!=='literal').map(part=>[part.type,part.value]));
+ const minutes=Number(parts.hour)*60+Number(parts.minute),weekday=parts.weekday;
+ const isOpen=['Mon','Tue','Wed','Thu','Fri'].includes(weekday)?minutes>=540&&minutes<1080:weekday==='Sat'?minutes>=540&&minutes<780:false;
+ return {is_open:isOpen,timezone:BUSINESS_HOURS.timezone,schedule_label:BUSINESS_HOURS.schedule_label};
+}
 const types={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json','.svg':'image/svg+xml'};
 const send=(res,status,value,headers={})=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',...headers});res.end(JSON.stringify(value))};
 const clean=(value,max)=>String(value??'').trim().slice(0,max);
@@ -47,8 +56,8 @@ const phone=value=>{let digits=String(value??'').replace(/\D/g,'');while(digits.
 const validPhone=value=>/^90\d{10}$/.test(value);
 const event=(id,actor,type,visibility,text,actorUserId=null)=>db.prepare('INSERT INTO request_events(request_id,actor_name,event_type,visibility,body,actor_user_id) VALUES(?,?,?,?,?,?)').run(id,actor,type,visibility,text,actorUserId);
 const requestSql="SELECT r.*,COALESCE(assigned.name,NULLIF(r.assigned_to,''),'') AS assigned_to,c.phone,c.name AS customer,c.company FROM requests r JOIN customers c ON c.id=r.customer_id LEFT JOIN team_members assigned ON assigned.id=r.assigned_user_id";
-const teamRequestListSql="SELECT r.request_number,r.category,r.priority,r.status,r.created_at,COALESCE(assigned.name,NULLIF(r.assigned_to,''),'') AS assigned_to,c.phone,c.name AS customer,c.company FROM requests r JOIN customers c ON c.id=r.customer_id LEFT JOIN team_members assigned ON assigned.id=r.assigned_user_id";
-const customerRequestListSql="SELECT r.request_number,r.public_token,r.category,r.priority,r.status,r.created_at,COALESCE(assigned.name,NULLIF(r.assigned_to,''),'') AS assigned_to FROM requests r JOIN customers c ON c.id=r.customer_id LEFT JOIN team_members assigned ON assigned.id=r.assigned_user_id";
+const teamRequestListSql="SELECT r.request_number,r.category,r.priority,r.status,r.is_emergency,r.created_at,COALESCE(assigned.name,NULLIF(r.assigned_to,''),'') AS assigned_to,c.phone,c.name AS customer,c.company FROM requests r JOIN customers c ON c.id=r.customer_id LEFT JOIN team_members assigned ON assigned.id=r.assigned_user_id";
+const customerRequestListSql="SELECT r.request_number,r.public_token,r.category,r.priority,r.status,r.is_emergency,r.created_at,COALESCE(assigned.name,NULLIF(r.assigned_to,''),'') AS assigned_to FROM requests r JOIN customers c ON c.id=r.customer_id LEFT JOIN team_members assigned ON assigned.id=r.assigned_user_id";
 const eventsFor=(id,customerOnly=false)=>db.prepare(`SELECT actor_user_id,actor_name,event_type,visibility,body,created_at FROM request_events WHERE request_id=? ${customerOnly?"AND visibility='customer'":''} ORDER BY id`).all(id);
 const revisionFor=id=>{const value=db.prepare('SELECT updated_at,(SELECT COALESCE(MAX(id),0) FROM request_events WHERE request_id=requests.id) AS event_id FROM requests WHERE id=?').get(id);return value?value.updated_at+':'+value.event_id:''};
 const detailed=(row,customerOnly=false)=>({...row,events:eventsFor(row.id,customerOnly),revision:revisionFor(row.id)});
@@ -81,6 +90,7 @@ function teamMemberInput(body){
 async function api(req,res,url){
  const method=req.method,route=url.pathname;
  if(method==='GET'&&route==='/api/health')return send(res,200,{ok:true,database:'sqlite'});
+ if(method==='GET'&&route==='/api/business-hours')return send(res,200,businessStatusAt());
  if(method==='POST'&&route==='/api/auth/login'){
   const bodyData=await readBody(req),username=clean(bodyData.username,50).toLocaleLowerCase('tr-TR'),password=String(bodyData.password||'');
   const user=db.prepare('SELECT id,name,username,role,active,password_hash FROM team_members WHERE username=?').get(username);
@@ -127,8 +137,10 @@ async function api(req,res,url){
  if(method==='GET'&&route==='/api/customer/requests'){let p=phone(url.searchParams.get('phone'));if(!validPhone(p))return send(res,422,{error:'Geçersiz telefon numarası.'});return send(res,200,{requests:db.prepare(customerRequestListSql+' WHERE c.phone=? ORDER BY r.id DESC').all(p)})}
  if(method==='GET'&&route==='/api/requests'){const user=requireUser(req,res);if(!user)return;return send(res,200,{requests:db.prepare(teamRequestListSql+' ORDER BY r.id DESC').all()})}
  if(method==='POST'&&route==='/api/requests'){
-  let b=await readBody(req),p=phone(b.phone),cat=clean(b.category,30),name=clean(b.name,80).replace(/[0-9]/g,''),company=clean(b.company,120);
+  let b=await readBody(req),p=phone(b.phone),cat=clean(b.category,30),name=clean(b.name,80).replace(/[0-9]/g,''),company=clean(b.company,120),isEmergency=b.is_emergency===true||cat==='emergency';
   if(!validPhone(p)||!categories.includes(cat))return send(res,422,{error:'Geçersiz telefon veya talep türü.'});
+  if((cat==='emergency')!==isEmergency)return send(res,422,{error:'Acil talep bilgisi geçersiz.'});
+  if(isEmergency&&businessStatusAt().is_open)return send(res,422,{error:'Acil Destek yalnızca mesai saatleri dışında kullanılabilir.'});
   if(!name)return send(res,422,{error:'Lütfen adınızı soyadınızı girin.'});
   let tl=b.amount_tl===''||b.amount_tl==null?null:Number(b.amount_tl),credit=b.credit_amount===''||b.credit_amount==null?null:Number(b.credit_amount);
   if((tl!==null&&(!Number.isFinite(tl)||tl<=0))||(credit!==null&&(!Number.isInteger(credit)||credit<=0))||(tl!==null&&credit!==null)||(cat==='credit'&&tl===null&&credit===null))return send(res,422,{error:'Geçerli TL veya kontör miktarından yalnızca birini girin.'});
@@ -138,7 +150,7 @@ async function api(req,res,url){
    let customer=db.prepare('SELECT id FROM customers WHERE phone=?').get(p),year=new Date().getFullYear(),prefix=`TK-${year}-`;
    let max=db.prepare('SELECT MAX(CAST(SUBSTR(request_number,?) AS INTEGER)) AS n FROM requests WHERE request_number LIKE ?').get(prefix.length+1,prefix+'%').n||0;
    let number=prefix+String(max+1).padStart(6,'0'),token=crypto.randomBytes(24).toString('hex');
-   let id=Number(db.prepare('INSERT INTO requests(request_number,public_token,customer_id,category,option_value,priority,description,anydesk_code,amount_tl,credit_amount) VALUES(?,?,?,?,?,?,?,?,?,?)').run(number,token,customer.id,cat,clean(b.option_value,60),cat==='credit'?'Acil':b.priority==='Acil'?'Acil':'Normal',clean(b.description,1500),desk,tl,credit).lastInsertRowid);
+    let id=Number(db.prepare('INSERT INTO requests(request_number,public_token,customer_id,category,option_value,priority,description,anydesk_code,amount_tl,credit_amount,is_emergency) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(number,token,customer.id,cat,clean(b.option_value,60),cat==='credit'||isEmergency?'Acil':b.priority==='Acil'?'Acil':'Normal',clean(b.description,1500),desk,tl,credit,isEmergency?1:0).lastInsertRowid);
     event(id,'Müşteri','created','customer','Müşteri talebi oluşturdu.');
    return {request_number:number,public_token:token,status:'Yeni Talep'};
   });return send(res,201,result)
@@ -189,5 +201,5 @@ const server=http.createServer(async(req,res)=>{try{
  res.writeHead(200,{'Content-Type':types[path.extname(file)]||'application/octet-stream','Cache-Control':'no-cache'});fs.createReadStream(file).pipe(res)
 }catch(error){console.error(error);if(!res.headersSent)send(res,error.status||500,{error:error.status?error.message:'Sunucu hatası.'})}});
 if(require.main===module)server.listen(process.env.PORT||3000,()=>console.log('Talep Merkezi: http://localhost:'+(process.env.PORT||3000)));
-module.exports={server,db};
+module.exports={server,db,businessStatusAt,setNowProviderForTests:provider=>{nowProvider=provider}};
 
