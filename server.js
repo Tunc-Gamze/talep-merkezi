@@ -8,9 +8,23 @@ CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,request_number TEXT U
 CREATE TABLE IF NOT EXISTS request_events(id INTEGER PRIMARY KEY,request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,actor_name TEXT NOT NULL,event_type TEXT NOT NULL,visibility TEXT NOT NULL CHECK(visibility IN ('customer','team')),body TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS team_members(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)));
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES team_members(id) ON DELETE CASCADE,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY,recipient_type TEXT NOT NULL CHECK(recipient_type IN ('team','customer')),user_id INTEGER REFERENCES team_members(id),customer_id INTEGER REFERENCES customers(id),type TEXT NOT NULL,title TEXT NOT NULL,message TEXT NOT NULL DEFAULT '',request_id INTEGER REFERENCES requests(id) ON DELETE CASCADE,source_key TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,read_at TEXT,CHECK((recipient_type='team' AND user_id IS NOT NULL AND customer_id IS NULL) OR (recipient_type='customer' AND customer_id IS NOT NULL AND user_id IS NULL)));
 CREATE INDEX IF NOT EXISTS requests_customer_idx ON requests(customer_id,id DESC);
 CREATE INDEX IF NOT EXISTS events_request_idx ON request_events(request_id,id);
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);`);
+const notificationColumns=db.prepare('PRAGMA table_info(notifications)').all();
+if(!notificationColumns.some(column=>column.name==='recipient_type')||!notificationColumns.some(column=>column.name==='customer_id')||notificationColumns.find(column=>column.name==='user_id')?.notnull){
+ db.exec(`CREATE TABLE notifications_new(id INTEGER PRIMARY KEY,recipient_type TEXT NOT NULL CHECK(recipient_type IN ('team','customer')),user_id INTEGER REFERENCES team_members(id),customer_id INTEGER REFERENCES customers(id),type TEXT NOT NULL,title TEXT NOT NULL,message TEXT NOT NULL DEFAULT '',request_id INTEGER REFERENCES requests(id) ON DELETE CASCADE,source_key TEXT NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,read_at TEXT,CHECK((recipient_type='team' AND user_id IS NOT NULL AND customer_id IS NULL) OR (recipient_type='customer' AND customer_id IS NOT NULL AND user_id IS NULL)));
+ INSERT INTO notifications_new(id,recipient_type,user_id,type,title,message,request_id,source_key,created_at,read_at) SELECT id,'team',user_id,type,title,message,request_id,source_key,created_at,read_at FROM notifications;
+ DROP TABLE notifications;
+ ALTER TABLE notifications_new RENAME TO notifications;`);
+}
+db.exec(`CREATE INDEX IF NOT EXISTS notifications_user_created_idx ON notifications(user_id,id DESC);
+CREATE INDEX IF NOT EXISTS notifications_user_unread_idx ON notifications(user_id,read_at,id DESC);
+CREATE INDEX IF NOT EXISTS notifications_customer_created_idx ON notifications(customer_id,id DESC);
+CREATE INDEX IF NOT EXISTS notifications_customer_unread_idx ON notifications(customer_id,read_at,id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS notifications_team_source_idx ON notifications(user_id,source_key) WHERE recipient_type='team';
+CREATE UNIQUE INDEX IF NOT EXISTS notifications_customer_source_idx ON notifications(customer_id,source_key) WHERE recipient_type='customer';`);
 const teamColumns=new Set(db.prepare('PRAGMA table_info(team_members)').all().map(column=>column.name));
 if(!teamColumns.has('username'))db.exec("ALTER TABLE team_members ADD COLUMN username TEXT NOT NULL DEFAULT ''");
 if(!teamColumns.has('role'))db.exec("ALTER TABLE team_members ADD COLUMN role TEXT NOT NULL DEFAULT 'destek'");
@@ -41,6 +55,7 @@ if(bootstrapAdmin){
 }
 const transitions={'Yeni Talep':['Teslim Alındı'],'Teslim Alındı':['İşleme Alındı'],'İşleme Alındı':['Müşteriden Bilgi Bekleniyor','Tamamlandı'],'Müşteriden Bilgi Bekleniyor':['Tamamlandı','İptal Edildi'],'Tamamlandı':[],'İptal Edildi':[]};
 const categories=['integration','printer','credit','caller','feature','other','emergency'];
+const categoryTitles={integration:'Entegrasyon',printer:'Yazıcı Kurulumu',credit:'Kontör Yükleme',caller:'Caller ID Kurulumu',feature:'Özellik Ekleme Talebi',other:'Diğer',emergency:'Acil Destek'};
 const BUSINESS_HOURS={timezone:'Europe/Istanbul',schedule_label:'Hafta içi 09.00–18.00 · Cumartesi 09.00–13.00'};
 let nowProvider=()=>new Date();
 function businessStatusAt(date=nowProvider()){
@@ -55,6 +70,8 @@ const clean=(value,max)=>String(value??'').trim().slice(0,max);
 const phone=value=>{let digits=String(value??'').replace(/\D/g,'');while(digits.length>12&&digits.startsWith('9'))digits=digits.slice(1);if(digits.startsWith('0'))digits='90'+digits.slice(1);else if(digits.startsWith('5'))digits='90'+digits;return digits};
 const validPhone=value=>/^90\d{10}$/.test(value);
 const event=(id,actor,type,visibility,text,actorUserId=null)=>db.prepare('INSERT INTO request_events(request_id,actor_name,event_type,visibility,body,actor_user_id) VALUES(?,?,?,?,?,?)').run(id,actor,type,visibility,text,actorUserId);
+const notifyTeam=(type,title,message,requestId,sourceKey,excludeUserId=null)=>db.prepare(`INSERT OR IGNORE INTO notifications(recipient_type,user_id,type,title,message,request_id,source_key) SELECT 'team',id,?,?,?,?,? FROM team_members WHERE active=1 ${excludeUserId===null?'':'AND id<>?'}`).run(...(excludeUserId===null?[type,title,message,requestId,sourceKey]:[type,title,message,requestId,sourceKey,excludeUserId]));
+const notifyCustomer=(customerId,type,title,message,requestId,sourceKey)=>db.prepare("INSERT OR IGNORE INTO notifications(recipient_type,customer_id,type,title,message,request_id,source_key) VALUES('customer',?,?,?,?,?,?)").run(customerId,type,title,message,requestId,sourceKey);
 const requestSql="SELECT r.*,COALESCE(assigned.name,NULLIF(r.assigned_to,''),'') AS assigned_to,c.phone,c.name AS customer,c.company FROM requests r JOIN customers c ON c.id=r.customer_id LEFT JOIN team_members assigned ON assigned.id=r.assigned_user_id";
 const teamRequestListSql="SELECT r.request_number,r.category,r.priority,r.status,r.is_emergency,r.created_at,COALESCE(assigned.name,NULLIF(r.assigned_to,''),'') AS assigned_to,c.phone,c.name AS customer,c.company FROM requests r JOIN customers c ON c.id=r.customer_id LEFT JOIN team_members assigned ON assigned.id=r.assigned_user_id";
 const customerRequestListSql="SELECT r.request_number,r.public_token,r.category,r.priority,r.status,r.is_emergency,r.created_at,COALESCE(assigned.name,NULLIF(r.assigned_to,''),'') AS assigned_to FROM requests r JOIN customers c ON c.id=r.customer_id LEFT JOIN team_members assigned ON assigned.id=r.assigned_user_id";
@@ -107,6 +124,24 @@ async function api(req,res,url){
   const user=currentUser(req);return user?send(res,200,{user}):send(res,401,{error:'Personel oturumu bulunamadı.'});
  }
  if(method==='GET'&&route==='/api/team'){const user=requireUser(req,res);if(!user)return;return send(res,200,{members:db.prepare(teamMemberSql+' WHERE active=1 ORDER BY name').all()})}
+ if(method==='GET'&&route==='/api/notifications'){
+  const user=requireUser(req,res);if(!user)return;
+  const notifications=db.prepare(`SELECT n.id,n.type,n.title,n.message,n.created_at,n.read_at,r.request_number FROM notifications n LEFT JOIN requests r ON r.id=n.request_id WHERE n.recipient_type='team' AND n.user_id=? ORDER BY n.id DESC LIMIT 50`).all(user.id);
+  const unread_count=db.prepare("SELECT COUNT(*) count FROM notifications WHERE recipient_type='team' AND user_id=? AND read_at IS NULL").get(user.id).count;
+  return send(res,200,{notifications,unread_count});
+ }
+ if(method==='PATCH'&&route==='/api/notifications/read-all'){
+  const user=requireUser(req,res);if(!user)return;
+  db.prepare("UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE recipient_type='team' AND user_id=? AND read_at IS NULL").run(user.id);
+  return send(res,200,{ok:true,unread_count:0});
+ }
+ const notificationReadMatch=route.match(/^\/api\/notifications\/(\d+)\/read$/);
+ if(notificationReadMatch&&method==='PATCH'){
+  const user=requireUser(req,res);if(!user)return;
+  const result=db.prepare("UPDATE notifications SET read_at=COALESCE(read_at,CURRENT_TIMESTAMP) WHERE id=? AND recipient_type='team' AND user_id=?").run(Number(notificationReadMatch[1]),user.id);
+  if(!result.changes)return send(res,404,{error:'Bildirim bulunamadı.'});
+  return send(res,200,{ok:true});
+ }
  if(route==='/api/admin/team-members'){
   const admin=requireUser(req,res,'admin');if(!admin)return;
   if(method==='GET')return send(res,200,{members:db.prepare(teamMemberSql+' ORDER BY active DESC,name').all()});
@@ -134,6 +169,25 @@ async function api(req,res,url){
   catch(error){if(String(error.message).includes('UNIQUE'))return send(res,409,{error:'Bu ad veya kullanıcı adı zaten kullanılıyor.'});throw error}
  }
  if(method==='GET'&&route==='/api/customers/lookup'){let p=phone(url.searchParams.get('phone'));return send(res,200,{customer:validPhone(p)?db.prepare('SELECT phone,name,company FROM customers WHERE phone=?').get(p)||null:null})}
+ if(method==='GET'&&route==='/api/customer/notifications'){
+  const p=phone(url.searchParams.get('phone'));if(!validPhone(p))return send(res,422,{error:'Geçersiz telefon numarası.'});
+  const customer=db.prepare('SELECT id FROM customers WHERE phone=?').get(p);if(!customer)return send(res,200,{notifications:[],unread_count:0});
+  const notifications=db.prepare(`SELECT n.id,n.type,n.title,n.message,n.created_at,n.read_at,r.request_number,r.public_token FROM notifications n JOIN requests r ON r.id=n.request_id WHERE n.recipient_type='customer' AND n.customer_id=? ORDER BY n.id DESC LIMIT 50`).all(customer.id);
+  const unread_count=db.prepare("SELECT COUNT(*) count FROM notifications WHERE recipient_type='customer' AND customer_id=? AND read_at IS NULL").get(customer.id).count;
+  return send(res,200,{notifications,unread_count});
+ }
+ if(method==='PATCH'&&route==='/api/customer/notifications/read-all'){
+  const bodyData=await readBody(req),p=phone(bodyData.phone);if(!validPhone(p))return send(res,422,{error:'Geçersiz telefon numarası.'});
+  const customer=db.prepare('SELECT id FROM customers WHERE phone=?').get(p);if(customer)db.prepare("UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE recipient_type='customer' AND customer_id=? AND read_at IS NULL").run(customer.id);
+  return send(res,200,{ok:true,unread_count:0});
+ }
+ const customerNotificationReadMatch=route.match(/^\/api\/customer\/notifications\/(\d+)\/read$/);
+ if(customerNotificationReadMatch&&method==='PATCH'){
+  const bodyData=await readBody(req),p=phone(bodyData.phone);if(!validPhone(p))return send(res,422,{error:'Geçersiz telefon numarası.'});
+  const customer=db.prepare('SELECT id FROM customers WHERE phone=?').get(p);if(!customer)return send(res,404,{error:'Bildirim bulunamadı.'});
+  const result=db.prepare("UPDATE notifications SET read_at=COALESCE(read_at,CURRENT_TIMESTAMP) WHERE id=? AND recipient_type='customer' AND customer_id=?").run(Number(customerNotificationReadMatch[1]),customer.id);
+  if(!result.changes)return send(res,404,{error:'Bildirim bulunamadı.'});return send(res,200,{ok:true});
+ }
  if(method==='GET'&&route==='/api/customer/requests'){let p=phone(url.searchParams.get('phone'));if(!validPhone(p))return send(res,422,{error:'Geçersiz telefon numarası.'});return send(res,200,{requests:db.prepare(customerRequestListSql+' WHERE c.phone=? ORDER BY r.id DESC').all(p)})}
  if(method==='GET'&&route==='/api/requests'){const user=requireUser(req,res);if(!user)return;return send(res,200,{requests:db.prepare(teamRequestListSql+' ORDER BY r.id DESC').all()})}
  if(method==='POST'&&route==='/api/requests'){
@@ -152,6 +206,8 @@ async function api(req,res,url){
    let number=prefix+String(max+1).padStart(6,'0'),token=crypto.randomBytes(24).toString('hex');
     let id=Number(db.prepare('INSERT INTO requests(request_number,public_token,customer_id,category,option_value,priority,description,anydesk_code,amount_tl,credit_amount,is_emergency) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(number,token,customer.id,cat,clean(b.option_value,60),cat==='credit'||isEmergency?'Acil':b.priority==='Acil'?'Acil':'Normal',clean(b.description,1500),desk,tl,credit,isEmergency?1:0).lastInsertRowid);
     event(id,'Müşteri','created','customer','Müşteri talebi oluşturdu.');
+    const customerLabel=company||name;
+    notifyTeam('new_request','Yeni talep: '+customerLabel+' - '+categoryTitles[cat],clean(b.description,120),id,'request:'+id);
    return {request_number:number,public_token:token,status:'Yeni Talep'};
   });return send(res,201,result)
  }
@@ -161,7 +217,7 @@ async function api(req,res,url){
   let row=db.prepare(requestSql+' WHERE r.request_number=? AND r.public_token=?').get(number,token);
   if(!row)return send(res,404,{error:'Talep bulunamadı.'});
   if(method==='GET')return send(res,200,{request:detailed(row,true)});
-  if(method==='POST'){let message=clean(b.message,1500);if(!message)return send(res,422,{error:'Mesaj boş olamaz.'});transaction(()=>{event(row.id,'Müşteri','message','customer','Müşteri mesajı: '+message);db.prepare('UPDATE requests SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(row.id)});return send(res,201,{request:detailed(getRequest(number),true)})}
+  if(method==='POST'){let message=clean(b.message,1500);if(!message)return send(res,422,{error:'Mesaj boş olamaz.'});transaction(()=>{const createdEvent=event(row.id,'Müşteri','message','customer','Müşteri mesajı: '+message);notifyTeam('customer_message',(row.company||row.customer)+' yeni mesaj gönderdi.',message.slice(0,120),row.id,'event:'+createdEvent.lastInsertRowid);db.prepare('UPDATE requests SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(row.id)});return send(res,201,{request:detailed(getRequest(number),true)})}
   }
   const revisionMatch=route.match(/^\/api\/requests\/([^/]+)\/revision$/);
   if(revisionMatch&&method==='GET'){
@@ -182,10 +238,10 @@ async function api(req,res,url){
      transaction(()=>{db.prepare("UPDATE requests SET assigned_user_id=?,assigned_to=?,status='Teslim Alındı',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(user.id,actor,row.id);event(row.id,actor,'assigned','customer',actor+' talebi devir aldı.',user.id)});
     }else if(b.action==='status'){
      let next=clean(b.status,80);if(!(row.assigned_user_id||row.assigned_to)||!transitions[row.status]?.includes(next))return send(res,422,{error:'Bu durum geçişine izin verilmiyor.'});
-     transaction(()=>{db.prepare('UPDATE requests SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(next,row.id);event(row.id,actor,'status','customer',actor+' durumu “'+next+'” olarak değiştirdi.',user.id)});
+     transaction(()=>{db.prepare('UPDATE requests SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(next,row.id);const createdEvent=event(row.id,actor,'status','customer',actor+' durumu “'+next+'” olarak değiştirdi.',user.id);notifyCustomer(row.customer_id,next==='Tamamlandı'?'request_completed':'status_changed',next==='Tamamlandı'?'Talebiniz tamamlandı':'Talebiniz güncellendi',row.request_number+' numaralı talebinizin durumu “'+next+'” olarak değiştirildi.',row.id,'event:'+createdEvent.lastInsertRowid)});
     }else if(b.action==='message'){
      let message=clean(b.message,1500),internal=b.internal===true;if(!message)return send(res,422,{error:'Mesaj boş olamaz.'});
-     transaction(()=>{event(row.id,actor,internal?'note':'message',internal?'team':'customer',actor+(internal?' · İç not: ':' · Müşteriye mesaj: ')+message,user.id);db.prepare('UPDATE requests SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(row.id)});
+     transaction(()=>{const createdEvent=event(row.id,actor,internal?'note':'message',internal?'team':'customer',actor+(internal?' · İç not: ':' · Müşteriye mesaj: ')+message,user.id);if(internal)notifyTeam('team_note',actor+' yeni bir ekip notu ekledi.',message.slice(0,120),row.id,'event:'+createdEvent.lastInsertRowid,user.id);else notifyCustomer(row.customer_id,'team_message','Yeni mesaj','Destek ekibi talebinize yeni mesaj gönderdi: '+message.slice(0,100),row.id,'event:'+createdEvent.lastInsertRowid);db.prepare('UPDATE requests SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(row.id)});
    }else return send(res,422,{error:'Geçersiz işlem.'});
    return send(res,200,{request:detailed(getRequest(number))})
   }
